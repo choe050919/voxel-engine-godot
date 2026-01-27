@@ -1,0 +1,90 @@
+[gd_scene load_steps=7 format=3 uid="uid://player001"]
+
+[ext_resource type="Script" uid="uid://cvt82n403wlcj" path="res://scripts/player/Player.gd" id="1_player"]
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_1"]
+radius = 0.35
+height = 1.8
+
+[sub_resource type="BoxMesh" id="BoxMesh_torso"]
+size = Vector3(0.5, 0.6, 0.25)
+
+[sub_resource type="StandardMaterial3D" id="Material_torso"]
+albedo_color = Color(0.34901962, 0.4509804, 0.54901963, 1)
+
+[sub_resource type="BoxMesh" id="BoxMesh_wr5hl"]
+size = Vector3(0.15, 0.8, 0.12)
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_gfjak"]
+albedo_color = Color(0.5370987, 0.58383155, 0.6262097, 1)
+
+[node name="Player" type="CharacterBody3D"]
+script = ExtResource("1_player")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
+shape = SubResource("CapsuleShape3D_1")
+
+[node name="Head" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.6, 0)
+
+[node name="Camera3D" type="Camera3D" parent="Head"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0.15)
+current = true
+fov = 80.0
+
+[node name="InteractRay" type="RayCast3D" parent="Head"]
+target_position = Vector3(0, 0, -3)
+
+[node name="CeilingCheck" type="RayCast3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.8, 0)
+target_position = Vector3(0, 0.7, 0)
+
+[node name="StepChecks" type="Node3D" parent="."]
+
+[node name="StepRayLow" type="RayCast3D" parent="StepChecks"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)
+target_position = Vector3(0, 0, -0.4)
+
+[node name="StepRayHigh" type="RayCast3D" parent="StepChecks"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.55, 0)
+target_position = Vector3(0, 0, -0.4)
+
+[node name="BodyMesh" type="Node3D" parent="."]
+
+[node name="Torso" type="MeshInstance3D" parent="BodyMesh"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.1, 0)
+mesh = SubResource("BoxMesh_torso")
+surface_material_override/0 = SubResource("Material_torso")
+
+[node name="LeftArmPivot" type="Node3D" parent="BodyMesh"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.32, 1.3, 0)
+
+[node name="LeftArm" type="MeshInstance3D" parent="BodyMesh/LeftArmPivot"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.25, 0)
+mesh = SubResource("BoxMesh_wr5hl")
+surface_material_override/0 = SubResource("StandardMaterial3D_gfjak")
+
+[node name="RightArmPivot" type="Node3D" parent="BodyMesh"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.32, 1.3, 0)
+
+[node name="RightArm" type="MeshInstance3D" parent="BodyMesh/RightArmPivot"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.25, 0)
+mesh = SubResource("BoxMesh_wr5hl")
+surface_material_override/0 = SubResource("StandardMaterial3D_gfjak")
+
+[node name="LeftLegPivot" type="Node3D" parent="BodyMesh"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.12, 0.8, 0)
+
+[node name="LeftLeg" type="MeshInstance3D" parent="BodyMesh/LeftLegPivot"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.4, 0)
+mesh = SubResource("BoxMesh_wr5hl")
+surface_material_override/0 = SubResource("StandardMaterial3D_gfjak")
+
+[node name="RightLegPivot" type="Node3D" parent="BodyMesh"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.12, 0.8, 0)
+
+[node name="RightLeg" type="MeshInstance3D" parent="BodyMesh/RightLegPivot"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.4, 0)
+mesh = SubResource("BoxMesh_wr5hl")
+surface_material_override/0 = SubResource("StandardMaterial3D_gfjak")
