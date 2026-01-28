@@ -112,20 +112,65 @@ func lock() -> void:
 	velocity = Vector3.ZERO  # 잠금 시에도 속도 초기화
 
 
+# ================================
+# Phase 5-3: Save/Load State
+# ================================
+
+## 현재 상태를 딕셔너리로 반환 (저장용)
+func get_save_data() -> Dictionary:
+	return {
+		"position": global_position,
+		"rotation_y": rotation.y,
+		"head_rotation_x": head.rotation.x if head else 0.0
+	}
+
+
+## 저장된 상태 적용 (로드용)
+func apply_save_data(data: Dictionary) -> void:
+	if data.is_empty():
+		return
+
+	# 위치 복원 (y에 오프셋 추가하여 바닥 관통 방지)
+	if data.has("position"):
+		var pos_data = data["position"]
+		var new_pos := Vector3(
+			pos_data.get("x", 8.0),
+			pos_data.get("y", 50.0),  # 안전 오프셋
+			pos_data.get("z", 8.0)
+		)
+		global_position = new_pos
+		print("[Player] Position restored to: %s" % new_pos)
+
+	# 회전 복원
+	if data.has("rotation_y"):
+		rotation.y = data["rotation_y"]
+
+	if data.has("head_rotation_x") and head:
+		head.rotation.x = data["head_rotation_x"]
+
+	# 속도 초기화
+	velocity = Vector3.ZERO
+
+
 func _input(event: InputEvent) -> void:
 	# 마우스 이동 처리 (시점 회전)
 	if event is InputEventMouseMotion:
 		_handle_mouse_look(event)
 		return
 
-	# ESC 키로 마우스 해제 (디버그용)
-	if event.is_action_pressed("ui_cancel"):
-		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+	# Note: ESC 키는 PauseMenu에서 처리 (Phase 5-2)
 
 	# F5: 시점 전환
 	if event.is_action_pressed("toggle_view"):
 		_cycle_view_mode()
 
+	# 블록 파괴
+	if event.is_action_pressed("block_break"):
+		_try_break_block()
+	
+	# 블록 설치
+	if event.is_action_pressed("block_place"):
+		_try_place_block()
 
 func _physics_process(delta: float) -> void:
 	# Phase 2-8: 월드 로딩 중이면 모든 물리 처리 차단
@@ -385,3 +430,33 @@ func _handle_walk_animation(delta: float) -> void:
 		right_arm_pivot.rotation.x = lerp(right_arm_pivot.rotation.x, 0.0, delta * 10.0)
 		left_leg_pivot.rotation.x = lerp(left_leg_pivot.rotation.x, 0.0, delta * 10.0)
 		right_leg_pivot.rotation.x = lerp(right_leg_pivot.rotation.x, 0.0, delta * 10.0)
+
+# ================================
+# Block Interaction
+# ================================
+func _try_break_block() -> void:
+	if not interact_ray.is_colliding():
+		return
+	
+	var hit_pos: Vector3 = interact_ray.get_collision_point()
+	var hit_normal: Vector3 = interact_ray.get_collision_normal()
+	
+	# 블록 중심 좌표 (표면에서 안쪽으로)
+	var block_pos: Vector3 = hit_pos - hit_normal * 0.5
+	var block_coord: Vector3i = Vector3i(floor(block_pos.x), floor(block_pos.y), floor(block_pos.z))
+	
+	WorldGenerator.instance.break_block(block_coord)
+
+
+func _try_place_block() -> void:
+	if not interact_ray.is_colliding():
+		return
+	
+	var hit_pos: Vector3 = interact_ray.get_collision_point()
+	var hit_normal: Vector3 = interact_ray.get_collision_normal()
+	
+	# 블록 설치 좌표 (표면에서 바깥쪽으로)
+	var place_pos: Vector3 = hit_pos + hit_normal * 0.5
+	var block_coord: Vector3i = Vector3i(floor(place_pos.x), floor(place_pos.y), floor(place_pos.z))
+	
+	WorldGenerator.instance.place_block(block_coord)

@@ -3,15 +3,134 @@ extends StaticBody3D
 ## VoxelChunk.gd - Seamless Chunk Borders
 ## Cross-Chunk Face Culling + WorkerThreadPool 멀티스레딩
 
-const CHUNK_SIZE = 16
-const CHUNK_HEIGHT = 64
+var _voxel_mutex: Mutex = Mutex.new()
+
+var _pending_mesh_update: bool = false
+var _pending_needs_collision: bool = false
+
+const CHUNK_SIZE: int = 16
+const CHUNK_HEIGHT: int = 64
+const VOXEL_DATA_SIZE: int = CHUNK_SIZE * CHUNK_HEIGHT * CHUNK_SIZE  # 16384
 
 # 생성된 물리 바디 참조 저장
 var _collision_rid: RID
 
-# 복셀 데이터 저장 (x, y, z)
-var _voxels: Dictionary = {}
+# ================================
+# Phase 3: PackedInt32Array 기반 복셀 데이터
+# 인덱스: y + x * CHUNK_HEIGHT + z * CHUNK_HEIGHT * CHUNK_SIZE
+# 값: 0 = 공기, 1+ = 블록 타입
+# ================================
+var _voxel_data: PackedInt32Array
 var chunk_position: Vector2i
+
+# ================================
+# Phase 5: Persistence State
+# ================================
+var _is_dirty: bool = false              # 수정 여부 (저장 필요)
+var _is_from_file: bool = false          # 파일에서 로드됨 (vs 노이즈 생성)
+
+
+## 생성자: 배열 초기화 보장
+func _init() -> void:
+	_init_voxel_data()
+
+
+## 인덱스 변환: (x, y, z) -> 1D 인덱스 (Y축 Stride=1 최적화)
+func _voxel_idx(x: int, y: int, z: int) -> int:
+	return y + x * CHUNK_HEIGHT + z * CHUNK_HEIGHT * CHUNK_SIZE
+
+
+## 범위 체크
+func _is_valid_local_pos(x: int, y: int, z: int) -> bool:
+	return x >= 0 and x < CHUNK_SIZE and y >= 0 and y < CHUNK_HEIGHT and z >= 0 and z < CHUNK_SIZE
+
+
+## 복셀 데이터 초기화
+func _init_voxel_data() -> void:
+	_voxel_data.resize(VOXEL_DATA_SIZE)
+	_voxel_data.fill(0)
+
+
+# ================================
+# Wrapper API (외부 접근용)
+# ================================
+
+## 복셀 존재 여부 확인
+func has_voxel(local_pos: Vector3i) -> bool:
+	if _voxel_data.size() != VOXEL_DATA_SIZE:
+		return false
+	if not _is_valid_local_pos(local_pos.x, local_pos.y, local_pos.z):
+		return false
+	return _voxel_data[_voxel_idx(local_pos.x, local_pos.y, local_pos.z)] != 0
+
+
+## 복셀 타입 조회 (없으면 0 반환)
+func get_voxel(local_pos: Vector3i) -> int:
+	if _voxel_data.size() != VOXEL_DATA_SIZE:
+		return 0
+	if not _is_valid_local_pos(local_pos.x, local_pos.y, local_pos.z):
+		return 0
+	return _voxel_data[_voxel_idx(local_pos.x, local_pos.y, local_pos.z)]
+
+
+## 복셀 설정 + Dirty 마킹
+func set_voxel(local_pos: Vector3i, block_type: int) -> void:
+	if _voxel_data.size() != VOXEL_DATA_SIZE:
+		return
+	if not _is_valid_local_pos(local_pos.x, local_pos.y, local_pos.z):
+		return
+	var idx := _voxel_idx(local_pos.x, local_pos.y, local_pos.z)
+	var old_value := _voxel_data[idx]
+	if old_value != block_type:
+		_voxel_data[idx] = block_type
+		_is_dirty = true  # 변경 시에만 Dirty
+
+
+## 복셀 삭제 + Dirty 마킹
+func erase_voxel(local_pos: Vector3i) -> void:
+	if _voxel_data.size() != VOXEL_DATA_SIZE:
+		return
+	if not _is_valid_local_pos(local_pos.x, local_pos.y, local_pos.z):
+		return
+	var idx := _voxel_idx(local_pos.x, local_pos.y, local_pos.z)
+	if _voxel_data[idx] != 0:
+		_voxel_data[idx] = 0
+		_is_dirty = true  # 변경 시에만 Dirty
+
+
+# ================================
+# Phase 5: Persistence API
+# ================================
+
+## Dirty 상태 확인
+func is_dirty() -> bool:
+	return _is_dirty
+
+
+## 저장 완료 후 Clean 마킹
+func mark_clean() -> void:
+	_is_dirty = false
+
+
+## 파일 로드 여부 확인
+func is_from_file() -> bool:
+	return _is_from_file
+
+
+## 전체 복셀 데이터 반환 (저장용)
+func get_voxel_data() -> PackedInt32Array:
+	return _voxel_data
+
+
+## 외부 데이터로 복셀 설정 (파일 로드용)
+func set_voxel_data_from_file(data: PackedInt32Array) -> void:
+	if data.size() != VOXEL_DATA_SIZE:
+		push_error("[VoxelChunk] Invalid voxel data size: %d (expected %d)" % [data.size(), VOXEL_DATA_SIZE])
+		return
+	_voxel_data = data
+	_is_from_file = true
+	_is_dirty = false  # 로드 직후는 Clean
+
 
 # 공유 머티리얼 (모든 청크가 동일한 머티리얼 사용)
 static var _shared_material: StandardMaterial3D = null
@@ -24,10 +143,10 @@ static var _mesh_instance_pool: Array[MeshInstance3D] = []
 # ================================
 # Phase 2-7: Thread State
 # ================================
-var _is_thread_running: bool = false          # 스레드 작업 진행 중
-var _thread_voxels: Dictionary = {}           # 스레드용 복셀 데이터 복사본
-var _thread_border_solids: Dictionary = {}    # 스레드용 경계면 솔리드 캐시
-var _thread_needs_collision: bool = false     # 완료 후 충돌체 생성 여부
+var _is_thread_running: bool = false              # 스레드 작업 진행 중
+var _thread_voxel_data: PackedInt32Array          # 스레드용 복셀 데이터 복사본
+var _thread_needs_collision: bool = false         # 완료 후 충돌체 생성 여부
+var _is_priority_update: bool = false             # 우선순위 업데이트 여부
 
 # ================================
 # Phase 2-Optimization: Threaded Physics
@@ -91,23 +210,29 @@ func generate_chunk_threaded(pos: Vector2i, noise_base: FastNoiseLite, noise_mtn
 	start_threaded_mesh_update(with_collision)
 
 
-func _generate_voxel_data(n1: FastNoiseLite, n2: FastNoiseLite):
-	_voxels.clear()
-	var global_x_start = chunk_position.x * CHUNK_SIZE
-	var global_z_start = chunk_position.y * CHUNK_SIZE
+func _generate_voxel_data(n1: FastNoiseLite, n2: FastNoiseLite) -> void:
+	_init_voxel_data()
+	var global_x_start: int = chunk_position.x * CHUNK_SIZE
+	var global_z_start: int = chunk_position.y * CHUNK_SIZE
 
 	for x in range(CHUNK_SIZE):
 		for z in range(CHUNK_SIZE):
-			var gx = global_x_start + x
-			var gz = global_z_start + z
+			var gx: int = global_x_start + x
+			var gz: int = global_z_start + z
 
-			var h1 = n1.get_noise_2d(gx, gz)
-			var h2 = n2.get_noise_2d(gx, gz)
-			var height = int((h1 * 20.0 + 20.0) + (h2 * 4.0))
-			height = clamp(height, 1, CHUNK_HEIGHT - 1)
+			var h1: float = n1.get_noise_2d(gx, gz)
+			var h2: float = n2.get_noise_2d(gx, gz)
+			var height: int = int((h1 * 20.0 + 20.0) + (h2 * 4.0))
+			height = clampi(height, 1, CHUNK_HEIGHT - 1)
 
+			# Y축 연속 메모리 접근 (캐시 친화적)
+			var base_idx: int = x * CHUNK_HEIGHT + z * CHUNK_HEIGHT * CHUNK_SIZE
 			for y in range(height + 1):
-				_voxels[Vector3i(x, y, z)] = 1
+				_voxel_data[base_idx + y] = 1
+
+	# Phase 5: 노이즈 생성 청크는 Dirty=false (저장 불필요)
+	_is_from_file = false
+	_is_dirty = false
 
 
 # ================================
@@ -119,70 +244,44 @@ func is_thread_running() -> bool:
 	return _is_thread_running
 
 
-## 스레드를 사용한 메쉬 업데이트 시작
-func start_threaded_mesh_update(with_collision: bool = false) -> void:
+func start_threaded_mesh_update(with_collision: bool = false, priority: bool = false) -> void:
 	if _is_thread_running:
-		return  # 이미 스레드 작업 중
+		if WorldGenerator.instance and WorldGenerator.instance.log_collision:
+			print("[PENDING] Chunk %s queuing pending update (was: %s, new collision: %s)" % [chunk_position, _pending_mesh_update, with_collision])
+		_pending_mesh_update = true
+		_pending_needs_collision = _pending_needs_collision or with_collision
+		return
 
-	if WorldGenerator.instance and WorldGenerator.instance.log_debug:
-		print("[DEBUG] Chunk %s starting mesh update, voxel count: %d" % [chunk_position, _voxels.size()])
+	var t0 := Time.get_ticks_usec()
 
-	# 스레드에서 사용할 데이터 복사 (Thread Safety)
-	_thread_voxels = _voxels.duplicate()
+	if WorldGenerator.instance and WorldGenerator.instance.log_collision:
+		print("[THREAD_START] Chunk %s, voxel_data size: %d, with_collision: %s" % [chunk_position, _voxel_data.size(), with_collision])
+
+	# ★ 안전장치: _voxel_data가 비어있으면 초기화 후 복사
+	_voxel_mutex.lock()
+	if _voxel_data.size() != VOXEL_DATA_SIZE:
+		_voxel_data.resize(VOXEL_DATA_SIZE)
+		_voxel_data.fill(0)
+	_thread_voxel_data = _voxel_data.duplicate()
+	_voxel_mutex.unlock()
+	var t1 := Time.get_ticks_usec()
+
 	_thread_needs_collision = with_collision
-
-	# 경계면 이웃 솔리드 상태 미리 캐싱 (Main Thread에서 안전하게)
-	_cache_border_neighbors()
+	_is_priority_update = priority
 
 	_is_thread_running = true
-
-	# WorkerThreadPool에 태스크 추가
 	WorkerThreadPool.add_task(_thread_build_mesh_arrays)
+	var t2 := Time.get_ticks_usec()
 
-
-## 경계면 이웃 블록의 솔리드 상태를 미리 캐싱 (Main Thread)
-func _cache_border_neighbors() -> void:
-	_thread_border_solids.clear()
-	
-	if WorldGenerator.instance == null:
-		return
-	
-	# X=0 경계 (LEFT 방향)
-	for z in range(CHUNK_SIZE):
-		for y in range(CHUNK_HEIGHT):
-			if _voxels.has(Vector3i(0, y, z)):  # 블록 있을 때만
-				_query_global_and_cache(Vector3i(-1, y, z))
-	
-	# X=CHUNK_SIZE-1 경계 (RIGHT 방향)
-	for z in range(CHUNK_SIZE):
-		for y in range(CHUNK_HEIGHT):
-			if _voxels.has(Vector3i(CHUNK_SIZE - 1, y, z)):
-				_query_global_and_cache(Vector3i(CHUNK_SIZE, y, z))
-	
-	# Z=0 경계 (FORWARD 방향)
-	for x in range(CHUNK_SIZE):
-		for y in range(CHUNK_HEIGHT):
-			if _voxels.has(Vector3i(x, y, 0)):
-				_query_global_and_cache(Vector3i(x, y, -1))
-	
-	# Z=CHUNK_SIZE-1 경계 (BACK 방향)
-	for x in range(CHUNK_SIZE):
-		for y in range(CHUNK_HEIGHT):
-			if _voxels.has(Vector3i(x, y, CHUNK_SIZE - 1)):
-				_query_global_and_cache(Vector3i(x, y, CHUNK_SIZE))
-
-
-func _query_global_and_cache(local_pos: Vector3i) -> void:
-	if _thread_border_solids.has(local_pos):
-		return
-	var global_pos: Vector3i = WorldGenerator.to_global_pos(chunk_position, local_pos)
-	_thread_border_solids[local_pos] = WorldGenerator.instance.is_block_solid_global(global_pos)
+	var total := t2 - t0
+	if total > 1000:
+		print("[SLOW_START] Chunk %s: dup=%d, total=%d µs" % [chunk_position, t1 - t0, total])
 
 
 ## [Worker Thread] 메쉬 및 충돌체 빌드 - Greedy Meshing 적용
 func _thread_build_mesh_arrays() -> void:
 	if WorldGenerator.instance and WorldGenerator.instance.log_mesh:
-		print("[THREAD] Chunk %s _thread_voxels.size() = %d" % [chunk_position, _thread_voxels.size()])
+		print("[THREAD] Chunk %s _thread_voxel_data.size() = %d" % [chunk_position, _thread_voxel_data.size()])
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 
@@ -214,6 +313,10 @@ func _thread_build_mesh_arrays() -> void:
 
 ## [Greedy Meshing] 특정 방향의 모든 면을 병합하여 생성 (Thread-Safe 버전)
 func _greedy_mesh_direction_threadsafe(st: SurfaceTool, dir: Vector3i) -> void:
+	# ★ 방어 코드: 배열 크기 검증 (Out of bounds 크래시 방지)
+	if _thread_voxel_data.size() != VOXEL_DATA_SIZE:
+		return
+
 	# 방향에 따른 축 설정
 	# slice_axis: 슬라이스를 나누는 축 (면의 법선 방향)
 	# u_axis, v_axis: 2D 평면의 두 축
@@ -265,7 +368,9 @@ func _greedy_mesh_direction_threadsafe(st: SurfaceTool, dir: Vector3i) -> void:
 				pos[u_axis] = u
 				pos[v_axis] = v
 
-				if _thread_voxels.has(pos):
+				# 인라인 인덱스 계산 (성능 최적화)
+				var idx: int = pos.y + pos.x * CHUNK_HEIGHT + pos.z * CHUNK_HEIGHT * CHUNK_SIZE
+				if _thread_voxel_data[idx] != 0:
 					var neighbor: Vector3i = pos + dir
 					if not _is_neighbor_solid_threadsafe(neighbor):
 						mask[u][v] = true
@@ -387,23 +492,26 @@ func _add_greedy_face(st: SurfaceTool, pos: Vector3i, dir: Vector3i, width: int,
 	st.add_vertex(verts[3])
 
 
-## [Main Thread] 스레드 작업 완료 콜백 (권한 박탈 - 오직 큐 등록만)
 func _on_thread_mesh_complete() -> void:
 	_is_thread_running = false
-
-	# 안전성 검사
+	
 	if not is_instance_valid(self) or not is_inside_tree():
 		_cleanup_thread_data()
 		return
-
-	# [핵심] 절대 finalize_build()를 여기서 호출하지 마십시오.
-	# 오직 WorldGenerator의 큐에 자신을 넣기만 합니다.
+	
+	# ★ 변경: PENDING 유무와 관계없이 일단 finalize 큐에 등록
+	# (사용자에게 즉각적인 피드백 제공, PENDING은 finalize 후 처리)
+	# Note: _is_priority_update는 finalize_build()에서 리셋 (물리 바이패스용)
 	if WorldGenerator.instance:
-		WorldGenerator.instance.request_chunk_apply(self)
-
+		if _is_priority_update:
+			WorldGenerator.instance.request_priority_chunk_apply(self)
+		else:
+			WorldGenerator.instance.request_chunk_apply(self)
 
 ## [Critical Optimization] 실제 노드 생성 및 씬 트리 적용 (WorldGenerator가 호출)
 func finalize_build() -> void:
+	if WorldGenerator.instance and WorldGenerator.instance.log_collision:
+		print("[FINALIZE_START] Chunk %s, thread_voxel_data: %d" % [chunk_position, _thread_voxel_data.size()])
 	var t0: int = Time.get_ticks_usec()
 	
 	# 1. 메쉬 적용 (MeshInstance3D 생성 및 add_child)
@@ -424,9 +532,15 @@ func finalize_build() -> void:
 		if dist <= Global.PHYSICS_DISTANCE:
 			needs_collision_now = true
 	
-	# 4. 충돌체 생성 요청
+	# 4. 충돌체 생성 - ★ 우선순위면 즉시, 아니면 큐
 	if needs_collision_now:
-		if WorldGenerator.instance:
+		if _is_priority_update:
+			# 플레이어 상호작용: 큐 무시하고 즉시 생성
+			create_collision_robust()
+			if WorldGenerator.instance and WorldGenerator.instance.log_collision:
+				print("[PRIORITY_COLLISION] Chunk %s immediate collision create" % chunk_position)
+		elif WorldGenerator.instance:
+			# 배경 로딩: 큐에 등록
 			WorldGenerator.instance.request_collision_create(self)
 	var t3: int = Time.get_ticks_usec()
 	
@@ -455,25 +569,32 @@ func finalize_build() -> void:
 		if mi and mi.mesh:
 			var aabb = mi.mesh.get_aabb()
 			print("[DIAG] Chunk (0,0) AABB: %s" % aabb)
+	
+	# ★ 추가: PENDING이 있으면 재업데이트 시작 (현재 결과는 이미 화면에 반영됨)
+	if _pending_mesh_update:
+		if WorldGenerator.instance and WorldGenerator.instance.log_collision:
+			print("[PENDING_RESTART] Chunk %s scheduling deferred update" % chunk_position)
+		_pending_mesh_update = false
+		var needs_col: bool = _pending_needs_collision
+		_pending_needs_collision = false
+		# call_deferred로 현재 finalize 완료 후 시작
+		call_deferred("start_threaded_mesh_update", needs_col, true)  # priority=true
+	
+	# ★ 마지막에 우선순위 플래그 리셋
+	_is_priority_update = false
 
 
 ## 스레드 데이터 정리
 func _cleanup_thread_data() -> void:
 	if WorldGenerator.instance and WorldGenerator.instance.log_collision:
-		print("[CLEANUP] voxels: %d, border: %d" % [_thread_voxels.size(), _thread_border_solids.size()])
-	_thread_voxels.clear()
-	_thread_border_solids.clear()
+		print("[CLEANUP] voxel_data: %d" % _thread_voxel_data.size())
+	_thread_voxel_data = PackedInt32Array()  # 메모리 해제
 	_thread_mesh = null
 	_thread_shape = null
 	# Note: _cached_shape는 정리하지 않음 (충돌체 재생성에 필요)
 
-
-## [Thread-Safe] 이웃 블록 솔리드 체크
+## [Thread-Safe] 이웃 블록 솔리드 확인 - 배열 인덱스 접근
 func _is_neighbor_solid_threadsafe(neighbor_local: Vector3i) -> bool:
-	# 방어 코드
-	if _thread_voxels == null or _thread_border_solids == null:
-		return false
-	
 	# Y축 범위 체크
 	if neighbor_local.y < 0 or neighbor_local.y >= CHUNK_HEIGHT:
 		return false
@@ -483,12 +604,16 @@ func _is_neighbor_solid_threadsafe(neighbor_local: Vector3i) -> bool:
 	var is_inside_z: bool = neighbor_local.z >= 0 and neighbor_local.z < CHUNK_SIZE
 
 	if is_inside_x and is_inside_z:
-		# 내부: 복사된 복셀 데이터에서 조회
-		return _thread_voxels.has(neighbor_local)
-	else:
-		# 경계면: 미리 캐싱된 데이터에서 조회
-		return _thread_border_solids.get(neighbor_local, false)
+		# 내부: 배열 인덱스 접근 (고속)
+		var idx: int = neighbor_local.y + neighbor_local.x * CHUNK_HEIGHT + neighbor_local.z * CHUNK_HEIGHT * CHUNK_SIZE
+		return _thread_voxel_data[idx] != 0
 
+	# 경계면: 이웃 청크 직접 조회 (Mutex)
+	if WorldGenerator.instance == null:
+		return false
+
+	var global_pos := WorldGenerator.to_global_pos(chunk_position, neighbor_local)
+	return WorldGenerator.instance.is_block_solid_threadsafe(global_pos)
 
 ## 동기식 메쉬 업데이트 (초기 생성용 - 기존 호환성 유지)
 func update_mesh() -> void:
@@ -518,6 +643,10 @@ func _build_mesh_data() -> ArrayMesh:
 
 ## [Greedy Meshing] 특정 방향의 모든 면을 병합하여 생성 (동기식 버전)
 func _greedy_mesh_direction_sync(st: SurfaceTool, dir: Vector3i) -> void:
+	# ★ 방어 코드: 배열 크기 검증
+	if _voxel_data.size() != VOXEL_DATA_SIZE:
+		return
+
 	var slice_axis: int
 	var u_axis: int
 	var v_axis: int
@@ -563,7 +692,9 @@ func _greedy_mesh_direction_sync(st: SurfaceTool, dir: Vector3i) -> void:
 				pos[u_axis] = u
 				pos[v_axis] = v
 
-				if _voxels.has(pos):
+				# 인라인 인덱스 계산 (성능 최적화)
+				var idx: int = pos.y + pos.x * CHUNK_HEIGHT + pos.z * CHUNK_HEIGHT * CHUNK_SIZE
+				if _voxel_data[idx] != 0:
 					var neighbor: Vector3i = pos + dir
 					if not _is_neighbor_solid(pos, neighbor, dir):
 						mask[u][v] = true
@@ -649,13 +780,11 @@ func _create_collision() -> void:
 func create_collision_robust() -> void:
 	var start_time: int = Time.get_ticks_usec()
 	
-	# 기존 RID가 있으면 해제
-	if _collision_rid.is_valid():
-		PhysicsServer3D.free_rid(_collision_rid)
-		_collision_rid = RID()
+	# 기존 RID 임시 저장 (나중에 삭제)
+	var old_rid: RID = _collision_rid
 	
 	if _cached_shape:
-		# 1. 바디 생성
+		# 1. 새 바디 먼저 생성
 		var body_rid = PhysicsServer3D.body_create()
 		PhysicsServer3D.body_set_mode(body_rid, PhysicsServer3D.BODY_MODE_STATIC)
 		
@@ -669,8 +798,14 @@ func create_collision_robust() -> void:
 		var space_rid = get_world_3d().space
 		PhysicsServer3D.body_set_space(body_rid, space_rid)
 		
-		# 5. RID 저장
+		# 5. 새 RID 저장
 		_collision_rid = body_rid
+	else:
+		_collision_rid = RID()
+	
+	# 6. 기존 충돌체 삭제 (새 것이 준비된 후)
+	if old_rid.is_valid():
+		PhysicsServer3D.free_rid(old_rid)
 	
 	var duration: int = Time.get_ticks_usec() - start_time
 	if duration > 1000 and WorldGenerator.instance and WorldGenerator.instance.log_collision:
@@ -718,7 +853,7 @@ func _create_mesh() -> void:
 
 
 ## ★ 이웃 블록 솔리드 체크 (로컬 vs 글로벌)
-func _is_neighbor_solid(local_pos: Vector3i, neighbor_local: Vector3i, dir: Vector3i) -> bool:
+func _is_neighbor_solid(_local_pos: Vector3i, neighbor_local: Vector3i, _dir: Vector3i) -> bool:
 	# Y축 범위 체크 (위아래는 항상 로컬)
 	if neighbor_local.y < 0 or neighbor_local.y >= CHUNK_HEIGHT:
 		return false
@@ -728,8 +863,9 @@ func _is_neighbor_solid(local_pos: Vector3i, neighbor_local: Vector3i, dir: Vect
 	var is_inside_z: bool = neighbor_local.z >= 0 and neighbor_local.z < CHUNK_SIZE
 
 	if is_inside_x and is_inside_z:
-		# 내부: 로컬 조회 (빠름)
-		return _voxels.has(neighbor_local)
+		# 내부: 배열 인덱스 접근 (고속)
+		var idx: int = neighbor_local.y + neighbor_local.x * CHUNK_HEIGHT + neighbor_local.z * CHUNK_HEIGHT * CHUNK_SIZE
+		return _voxel_data[idx] != 0
 	else:
 		# 경계면: 글로벌 조회 (WorldGenerator 통해)
 		if WorldGenerator.instance == null:
@@ -803,3 +939,17 @@ static func prewarm_pool(count: int) -> void:
 		var mi := MeshInstance3D.new()
 		_mesh_instance_pool.append(mi)
 	print("[POOL] Prewarmed %d MeshInstance3D" % count)
+
+
+## Thread-safe 복셀 존재 확인
+func has_voxel_threadsafe(local_pos: Vector3i) -> bool:
+	if not _is_valid_local_pos(local_pos.x, local_pos.y, local_pos.z):
+		return false
+	_voxel_mutex.lock()
+	if _voxel_data.size() != VOXEL_DATA_SIZE:
+		_voxel_mutex.unlock()
+		return false
+	var idx: int = local_pos.y + local_pos.x * CHUNK_HEIGHT + local_pos.z * CHUNK_HEIGHT * CHUNK_SIZE
+	var result: bool = _voxel_data[idx] != 0
+	_voxel_mutex.unlock()
+	return result

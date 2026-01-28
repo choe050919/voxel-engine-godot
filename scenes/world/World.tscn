@@ -1,7 +1,8 @@
-[gd_scene load_steps=6 format=3 uid="uid://world001"]
+[gd_scene format=3 uid="uid://world001"]
 
 [ext_resource type="Script" uid="uid://vhq2otht0yms" path="res://scripts/world/WorldGenerator.gd" id="1_worldgen"]
 [ext_resource type="PackedScene" uid="uid://player001" path="res://scenes/player/Player.tscn" id="2_player"]
+[ext_resource type="PackedScene" path="res://scenes/PauseMenu.tscn" id="3_pausemenu"]
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_1"]
 sky_top_color = Color(0.35, 0.55, 0.8, 1)
@@ -22,27 +23,28 @@ tonemap_mode = 2
 ssao_enabled = true
 ssao_radius = 2.0
 glow_enabled = true
-glow_intensity = 0.3
 fog_enabled = true
 fog_light_color = Color(0.7, 0.75, 0.85, 1)
 fog_density = 0.002
 fog_sky_affect = 0.3
 
-[node name="World" type="Node3D"]
+[node name="World" type="Node3D" unique_id=1365023060]
 
-[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=970162660]
 environment = SubResource("Environment_1")
 
-[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=912753850]
 transform = Transform3D(0.866, -0.354, 0.354, 0, 0.707, 0.707, -0.5, -0.612, 0.612, 0, 50, 0)
 shadow_enabled = true
 shadow_bias = 0.02
 directional_shadow_mode = 1
 directional_shadow_max_distance = 150.0
 
-[node name="WorldGenerator" type="Node3D" parent="."]
+[node name="WorldGenerator" type="Node3D" parent="." unique_id=1152099898]
 script = ExtResource("1_worldgen")
 log_collision = true
 
-[node name="Player" parent="." instance=ExtResource("2_player")]
+[node name="Player" parent="." unique_id=1102600826 instance=ExtResource("2_player")]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 8, 50, 8)
+
+[node name="PauseMenu" parent="." unique_id=1271395122 instance=ExtResource("3_pausemenu")]

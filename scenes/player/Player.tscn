@@ -34,7 +34,7 @@ current = true
 fov = 80.0
 
 [node name="InteractRay" type="RayCast3D" parent="Head"]
-target_position = Vector3(0, 0, -3)
+target_position = Vector3(0, 0, -5)
 
 [node name="CeilingCheck" type="RayCast3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.8, 0)

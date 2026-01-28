@@ -50,6 +50,12 @@ const CHUNK_APPLIES_PER_FRAME: int = 1              # 프레임당 적용할 청
 const COLLISION_CREATES_PER_FRAME: int = 1          # 프레임당 충돌체 생성 수
 
 # ================================
+# Thread Pool Saturation Prevention (스레드 기아 방지)
+# ================================
+const MAX_CONCURRENT_BACKGROUND_TASKS: int = 6      # 배경 작업 최대 동시 실행 수
+var _current_background_tasks: int = 0              # 현재 실행 중인 배경 작업 수
+
+# ================================
 # Player Tracking
 # ================================
 var player: Node3D = null
@@ -90,6 +96,9 @@ var _initial_chunks_finalized: int = 0            # finalize_build 완료된 청
 var _loading_screen: LoadingScreen = null         # 로딩 UI 참조
 const INITIAL_LOAD_RADIUS: int = 3                # 초기 로딩 반경 (Physics Distance 기반)
 
+# ㅇㅇ
+var _priority_apply_queue: Array[VoxelChunk] = []
+
 # 인접 청크 방향 (4방향)
 const NEIGHBOR_OFFSETS: Array[Vector2i] = [
 	Vector2i(1, 0),   # +X
@@ -100,6 +109,12 @@ const NEIGHBOR_OFFSETS: Array[Vector2i] = [
 
 
 func _ready() -> void:
+	# Phase 5-2: 안전장치 - 메인 메뉴를 거치지 않고 실행되었을 경우 방어
+	if SaveManager.current_world_id == "":
+		push_warning("[WorldGenerator] No world loaded. Returning to MainMenu.")
+		get_tree().call_deferred("change_scene_to_file", "res://scenes/MainMenu.tscn")
+		return
+
 	instance = self
 	_setup_noise()
 	_setup_initial_loading()
@@ -112,6 +127,8 @@ func _ready() -> void:
 
 func _exit_tree() -> void:
 	if instance == self:
+		# Phase 5: 종료 시 모든 Dirty 청크 동기 저장
+		SaveManager.flush_dirty_chunks_sync(active_chunks)
 		instance = null
 
 
@@ -296,7 +313,15 @@ func _find_player() -> void:
 ## 노이즈 설정
 func _setup_noise() -> void:
 	noise_base = FastNoiseLite.new()
-	noise_base.seed = randi()
+	
+	# 저장 매니저에서 현재 월드의 시드를 가져옴
+	var saved_seed = SaveManager.get_current_seed()
+	if saved_seed != 0:
+		noise_base.seed = saved_seed
+		print("[WorldGenerator] Applied saved seed: %d" % saved_seed)
+	else:
+		noise_base.seed = randi() # 비상용
+	
 	noise_base.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	noise_base.frequency = 0.01
 	noise_base.fractal_octaves = 4
@@ -398,6 +423,16 @@ func _on_chunk_mesh_thread_completed(chunk: VoxelChunk) -> void:
 	# (메쉬 업데이트는 기존 청크 갱신이므로 카운트하지 않음)
 
 
+## ★ 배경 작업 완료 콜백 (스레드 풀 여유 확보)
+func _on_background_task_completed() -> void:
+	if _current_background_tasks > 0:
+		_current_background_tasks -= 1
+	
+	# 대기 중인 작업이 있으면 즉시 처리 시도
+	if chunk_load_queue.size() > 0:
+		_process_load_queue()
+
+
 # ================================
 # Phase 2-Optimization: Chunk Apply Queue (Main Thread Throttling)
 # ================================
@@ -415,16 +450,31 @@ func request_chunk_apply(chunk: VoxelChunk) -> void:
 
 ## 청크 적용 큐 처리
 func _process_chunk_apply_queue() -> void:
+	var frame_start: int = Time.get_ticks_usec()
+
+	# ★ 우선순위 큐: 무조건 모두 처리 (타임 버짓 무시)
+	while not _priority_apply_queue.is_empty():
+		var chunk = _priority_apply_queue.pop_front()
+		if is_instance_valid(chunk) and chunk.is_inside_tree() and active_chunks.has(chunk.chunk_position):
+			if chunk.has_method("finalize_build"):
+				chunk.finalize_build()
+
 	if _chunk_apply_queue.is_empty():
 		return
 
-	# 로딩 중에는 10개씩, 게임 중에는 1개씩
-	var process_count: int = 10 if _is_initial_loading else 1
+	# ★ 초기 로딩: 큐 전체를 한 프레임에 처리 (타임 버짓 무시)
+	# ★ 일반 상태: 프레임당 1개, 8ms 타임 버짓 적용
+	var process_count: int = _chunk_apply_queue.size() if _is_initial_loading else 1
 
 	for i in range(process_count):
+		# ★ 타임 버짓 체크 - 초기 로딩 시 건너뜀
+		if not _is_initial_loading:
+			if Time.get_ticks_usec() - frame_start > 8000:
+				if log_perf:
+					print("[TIME_BUDGET] Chunk apply paused at %d µs" % (Time.get_ticks_usec() - frame_start))
+				break
 		if _chunk_apply_queue.is_empty():
 			break
-
 		var chunk = _chunk_apply_queue.pop_front()
 		if not is_instance_valid(chunk):
 			continue
@@ -432,29 +482,23 @@ func _process_chunk_apply_queue() -> void:
 			continue
 		if not active_chunks.has(chunk.chunk_position):
 			continue
-
 		if chunk.has_method("finalize_build"):
 			chunk.finalize_build()
-
-		# 초기 로딩 중 진행 상황 업데이트
 		if _is_initial_loading:
 			_initial_chunks_finalized += 1
-
-	# 로딩 UI 업데이트 (루프 밖에서 한 번만)
+	
 	if _is_initial_loading:
+		# 로딩 진행률 업데이트
 		if _loading_screen and is_instance_valid(_loading_screen):
-			var remaining: int = _chunk_apply_queue.size() + _mesh_update_queue.size() + chunk_load_queue.size()
-			var total: int = remaining + _initial_chunks_finalized
-			_loading_screen.update_progress(_initial_chunks_finalized, total)
+			_loading_screen.update_progress(_initial_chunks_finalized, _initial_chunks_to_load)
 
-		if _chunk_apply_queue.is_empty() and _mesh_update_queue.is_empty() and chunk_load_queue.is_empty():
-			var running_threads: int = 0
-			for chunk in active_chunks.values():
-				if chunk.is_thread_running():
-					running_threads += 1
+		# ★ 초기 청크 수만큼 finalize 완료되면 즉시 로딩 종료
+		# 나머지 청크는 게임 중 배경에서 로드
+		if _initial_chunks_finalized >= _initial_chunks_to_load:
 			if log_diag:
-				print("[DIAG] Queues empty. Running threads: %d" % running_threads)
-
+				print("[DIAG] Initial chunks finalized: %d/%d. Starting game!" % [
+					_initial_chunks_finalized, _initial_chunks_to_load
+				])
 			_finish_initial_loading()
 
 
@@ -485,10 +529,6 @@ func _process_collision_request_queue() -> void:
 			continue
 
 		if not active_chunks.has(chunk.chunk_position):
-			continue
-
-		# 이미 충돌체가 있으면 스킵
-		if chunk.has_physics_body():
 			continue
 
 		# 충돌체 생성 (캐시된 쉐이프 사용)
@@ -545,88 +585,70 @@ func _recalculate_physics_states(center: Vector2i) -> void:
 # ================================
 
 ## 초기 로딩 완료 처리
+## 초기 로딩 완료 처리 (수정본)
 func _finish_initial_loading() -> void:
 	VoxelChunk.prewarm_pool(200)
-	
-	_is_initial_loading = false
 
+	_is_initial_loading = false
 	if log_diag:
 		print("=" .repeat(60))
 		print("[DIAG] ===== INITIAL LOADING FINISH SEQUENCE =====")
-		print("[DIAG] Initial chunks finalized count: %d / %d" % [_initial_chunks_finalized, _initial_chunks_to_load])
 
-	# 스폰 청크 상태 확인
-	var start_chunk_key := Vector2i(0, 0)
-	var chunk_exists: bool = active_chunks.has(start_chunk_key)
-	if log_diag:
-		print("[DIAG] Spawn Chunk (0,0) exists: %s" % chunk_exists)
+	# 1. [FIX] 플레이어 데이터 먼저 로드 (위치 파악을 위해)
+	var target_chunk_pos := Vector2i(0, 0)
+	var player_data := {}
+	
+	if SaveManager.current_world_id != "":
+		player_data = SaveManager.get_player_data_from_world_meta()
+		if not player_data.is_empty() and player_data.has("position"):
+			var pos_dict = player_data["position"]
+			var pos_vec = Vector3(pos_dict.x, pos_dict.y, pos_dict.z)
+			# 플레이어가 로드될 청크 계산
+			target_chunk_pos = Global.world_to_chunk(pos_vec)
+			if log_diag:
+				print("[DIAG] Save data found. Target chunk: %s" % target_chunk_pos)
 
-	if chunk_exists:
-		var start_chunk: VoxelChunk = active_chunks[start_chunk_key]
-		if log_diag:
-			print("[DIAG] Spawn Chunk has_collision (before wait): %s" % start_chunk.has_collision())
-			print("[DIAG] Spawn Chunk is_thread_running: %s" % start_chunk.is_thread_running())
+	# 2. [FIX] 플레이어가 서 있을 '그 청크'가 준비될 때까지 대기
+	# (기존에는 무조건 (0,0)만 기다렸음)
+	await _wait_for_spawn_chunk_collision(target_chunk_pos)
 
-	# ★ Phase 2-8 Re-Fix: 충돌체 검증 루프
-	var wait_frames: int = await _wait_for_spawn_chunk_collision()
-	if log_diag:
-		print("[DIAG] Waited %d frames for collision" % wait_frames)
-
-	# 대기 후 상태 재확인
-	if chunk_exists:
-		var start_chunk: VoxelChunk = active_chunks[start_chunk_key]
-		if log_diag:
-			print("[DIAG] Spawn Chunk has_collision (after wait): %s" % start_chunk.has_collision())
-
-	if log_diag:
-		print("[DIAG] Physics collision confirmed! Spawning player...")
-
-	# 물리 엔진 안정화 대기 (2 physics frames)
+	# 물리 엔진 안정화 대기
 	await get_tree().physics_frame
 	await get_tree().physics_frame
 
-	# 플레이어 위치 로그 (스냅 전)
-	if player and log_diag:
-		print("[DIAG] Player Global Position BEFORE snap: %s" % player.global_position)
-
-	# 플레이어 지면 스냅
+	# 3. 플레이어 위치 복원
 	if player:
-		_snap_player_to_ground()
+		if not player_data.is_empty() and player.has_method("apply_save_data"):
+			player.apply_save_data(player_data)
+			if log_diag:
+				print("[DIAG] Player position restored from save")
+		else:
+			_snap_player_to_ground()
 
-	# 플레이어 위치 로그 (스냅 후)
-	if player and log_diag:
-		print("[DIAG] Player Global Position AFTER snap: %s" % player.global_position)
+	await _verify_floor_with_raycast_retry()
 
-	# RayCast 검증 (실패 시 재시도)
-	var raycast_success: bool = await _verify_floor_with_raycast_retry()
-
-	if not raycast_success and log_diag:
-		print("[DIAG] WARNING: RayCast failed after retries! Proceeding anyway...")
-
-	# 로딩 UI 페이드 아웃 및 삭제
+	# 물리 버블 초기화
+	if player:
+		_physics_bubble_center = Global.world_to_chunk(player.global_position)
+	
+	# 로딩 화면 종료 및 잠금 해제
 	if _loading_screen and is_instance_valid(_loading_screen):
 		_loading_screen.finish_loading()
 		_loading_screen = null
 
-	# Phase 2-9: 물리 버블 중심 초기화
-	_physics_bubble_center = Vector2i(0, 0)
-	if log_diag:
-		print("[DIAG] Physics bubble center set to: %s" % _physics_bubble_center)
-
-	# 플레이어 잠금 해제 (스냅 후에 해제)
 	if player and player.has_method("unlock"):
 		player.unlock()
-
+	
 	if log_diag:
-		print("[DIAG] Player unlocked. Game starting!")
-		print("[DIAG] ===== LOADING SEQUENCE COMPLETE =====")
-		print("=" .repeat(60))
-
+		print("[DIAG] Game starting!")
 
 ## Phase 2-8 Critical Fix: 스폰 청크 충돌체 대기 (실제 물리 노드 검증)
-func _wait_for_spawn_chunk_collision() -> int:
-	var start_chunk_key := Vector2i(0, 0)
+func _wait_for_spawn_chunk_collision(target_chunk: Vector2i = Vector2i(0, 0)) -> int:
+	var start_chunk_key := target_chunk
 	var total_wait_frames: int = 0
+
+	if log_diag:
+		print("[DIAG] Waiting for target chunk %s collision..." % target_chunk)
 
 	# 1. 청크가 active_chunks에 존재할 때까지 대기
 	while not active_chunks.has(start_chunk_key):
@@ -865,7 +887,7 @@ func is_block_solid_global(global_pos: Vector3i) -> bool:
 	var local_pos := Vector3i(local_x, global_pos.y, local_z)
 
 	var chunk: VoxelChunk = active_chunks[chunk_pos]
-	return chunk._voxels.has(local_pos)
+	return chunk.has_voxel(local_pos)
 
 
 ## 청크 좌표와 로컬 좌표를 글로벌 좌표로 변환
@@ -937,8 +959,26 @@ func _calculate_chunks_to_unload(center: Vector2i) -> void:
 # Queue Processing
 # ================================
 
+## 현재 최대 동시 실행 작업 수 반환
+## 초기 로딩 시 CPU 코어 최대 활용, 이후에는 배경 작업 제한
+func _get_current_max_tasks() -> int:
+	if _is_initial_loading:
+		return maxi(1, OS.get_processor_count() - 1)
+	return MAX_CONCURRENT_BACKGROUND_TASKS
+
+
 func _process_load_queue() -> void:
+	var max_tasks: int = _get_current_max_tasks()
+
+	# ★ 스레드 풀 포화 시 생성 중단 (여유 스레드 확보)
+	if _current_background_tasks >= max_tasks:
+		return
+
 	while chunk_load_queue.size() > 0 and chunks_generated_this_frame < Global.CHUNKS_PER_FRAME:
+		# ★ 루프 내에서도 체크 (한 프레임에 여러 개 생성 시)
+		if _current_background_tasks >= max_tasks:
+			break
+		
 		var chunk_pos: Vector2i = chunk_load_queue.pop_front()
 
 		if active_chunks.has(chunk_pos):
@@ -983,37 +1023,99 @@ func _process_unload_queue() -> void:
 func _create_chunk(chunk_pos: Vector2i) -> void:
 	if active_chunks.has(chunk_pos):
 		return
-	
-	# 캐시에서 복원 시도
+
+	# 1. 캐시에서 복원 시도
 	if _chunk_cache.has(chunk_pos):
 		var chunk: VoxelChunk = _chunk_cache[chunk_pos]
 		_chunk_cache.erase(chunk_pos)
 		active_chunks[chunk_pos] = chunk
 		chunk.visible = true
-		
+
 		var dist: float = Vector2(last_player_chunk - chunk_pos).length()
 		if dist <= Global.PHYSICS_DISTANCE:
 			chunk.enable_collision()
 		return
-	
-	# 새로 생성 (기존 코드)
+
+	# 2. Phase 5: 저장 파일 확인
+	if SaveManager.has_saved_chunk(chunk_pos):
+		_load_chunk_from_file(chunk_pos)
+		return
+
+	# 3. 노이즈 생성 (기존 로직)
+	_generate_new_chunk(chunk_pos)
+
+
+## Phase 5: 파일에서 청크 로드
+func _load_chunk_from_file(chunk_pos: Vector2i) -> void:
+	var voxel_data := SaveManager.load_chunk_sync(chunk_pos)
+	if voxel_data.is_empty():
+		# 파일 손상 시 노이즈 재생성
+		if log_perf:
+			print("[LOAD_FILE] Chunk %s file corrupted, regenerating" % chunk_pos)
+		_generate_new_chunk(chunk_pos)
+		return
+
 	var chunk := VoxelChunk.new()
 	add_child(chunk)
-	
-	var dist: float = Vector2(last_player_chunk - chunk_pos).length()
-	var needs_collision: bool = dist <= Global.PHYSICS_DISTANCE
-	
+
+	chunk.chunk_position = chunk_pos
+	chunk.position = Vector3(chunk_pos.x * VoxelChunk.CHUNK_SIZE, 0, chunk_pos.y * VoxelChunk.CHUNK_SIZE)
+	chunk.set_voxel_data_from_file(voxel_data)
+
+	# 배경 작업 카운트
+	_current_background_tasks += 1
+	if not chunk.mesh_thread_completed.is_connected(_on_background_task_completed):
+		chunk.mesh_thread_completed.connect(_on_background_task_completed, CONNECT_ONE_SHOT)
+
+	# 메쉬 빌드 (스레드)
+	var needs_collision := _is_physics_distance(chunk_pos)
+	chunk.start_threaded_mesh_update(needs_collision)
+
+	active_chunks[chunk_pos] = chunk
+
+	if log_perf:
+		print("[LOAD_FILE] Chunk %s loaded from file" % chunk_pos)
+
+
+## 노이즈 기반 새 청크 생성
+func _generate_new_chunk(chunk_pos: Vector2i) -> void:
+	var chunk := VoxelChunk.new()
+	add_child(chunk)
+
+	var needs_collision := _is_physics_distance(chunk_pos)
+
+	_current_background_tasks += 1
+	if not chunk.mesh_thread_completed.is_connected(_on_background_task_completed):
+		chunk.mesh_thread_completed.connect(_on_background_task_completed, CONNECT_ONE_SHOT)
+
 	chunk.generate_chunk_threaded(chunk_pos, noise_base, noise_mountain, needs_collision)
 	active_chunks[chunk_pos] = chunk
+
+
+## 물리 거리 내 확인 헬퍼
+func _is_physics_distance(chunk_pos: Vector2i) -> bool:
+	if player == null:
+		return true  # 초기 로딩 시 안전하게 true
+	var player_chunk := Global.world_to_chunk(player.global_position)
+	var dist := Vector2(player_chunk - chunk_pos).length()
+	return dist <= Global.PHYSICS_DISTANCE
 
 
 func _remove_chunk(chunk_pos: Vector2i) -> void:
 	if not active_chunks.has(chunk_pos):
 		return
-	
+
 	var chunk: VoxelChunk = active_chunks[chunk_pos]
+
+	# Phase 5: Dirty 청크는 저장
+	if chunk.is_dirty():
+		SaveManager.save_chunk_async(chunk_pos, chunk.get_voxel_data())
+		chunk.mark_clean()
+		if log_perf:
+			print("[SAVE] Chunk %s queued for save (dirty)" % chunk_pos)
+
 	active_chunks.erase(chunk_pos)
-	
+
 	# 스레드 돌아가는 중이거나 캐시 여유 있으면 캐시로
 	if chunk.is_thread_running() or _chunk_cache.size() < MAX_CACHED_CHUNKS:
 		_chunk_cache[chunk_pos] = chunk
@@ -1059,7 +1161,7 @@ func get_spawn_position() -> Vector3:
 	if active_chunks.has(spawn_chunk):
 		var chunk: VoxelChunk = active_chunks[spawn_chunk]
 		for y in range(VoxelChunk.CHUNK_HEIGHT - 1, -1, -1):
-			if chunk._voxels.has(Vector3i(center_x, y, center_z)):
+			if chunk.has_voxel(Vector3i(center_x, y, center_z)):
 				return Vector3(center_x, y + 2, center_z)
 
 	return Vector3(center_x, 50, center_z)
@@ -1137,3 +1239,119 @@ func _cleanup_chunk_cache() -> void:
 		var chunk: VoxelChunk = _chunk_cache[pos]
 		_chunk_cache.erase(pos)
 		chunk.queue_free()
+
+# ================================
+# Block Modification
+# ================================
+func place_block(global_pos: Vector3i, block_type: int = 1) -> void:
+	var t0 := Time.get_ticks_usec()  # 추가
+	
+	var chunk_pos := Vector2i(
+		floori(float(global_pos.x) / VoxelChunk.CHUNK_SIZE),
+		floori(float(global_pos.z) / VoxelChunk.CHUNK_SIZE)
+	)
+	
+	if not active_chunks.has(chunk_pos):
+		return
+	
+	var chunk: VoxelChunk = active_chunks[chunk_pos]
+	var local_pos := _global_to_local(global_pos, chunk_pos)
+
+	chunk.set_voxel(local_pos, block_type)
+	var t1 := Time.get_ticks_usec()
+
+	_refresh_chunk_and_neighbors(chunk_pos, local_pos)
+	var t2 := Time.get_ticks_usec()  # 추가
+	
+	# 추가: 타이밍 로그
+	print("[PLACE] setup: %d µs, refresh: %d µs, total: %d µs" % [t1 - t0, t2 - t1, t2 - t0])
+
+func break_block(global_pos: Vector3i) -> void:
+	var t0 := Time.get_ticks_usec()  # 추가
+	
+	var chunk_pos := Vector2i(
+		floori(float(global_pos.x) / VoxelChunk.CHUNK_SIZE),
+		floori(float(global_pos.z) / VoxelChunk.CHUNK_SIZE)
+	)
+	
+	if not active_chunks.has(chunk_pos):
+		if log_debug:
+			print("[BLOCK] Chunk %s not in active_chunks" % chunk_pos)
+		return
+	
+	var chunk: VoxelChunk = active_chunks[chunk_pos]
+	var local_pos := _global_to_local(global_pos, chunk_pos)
+	
+	# 디버그: 스레드 상태 확인
+	if log_debug:
+		print("[BLOCK] Breaking at global: %s" % global_pos)
+		print("[BLOCK] Chunk %s thread_running: %s" % [chunk_pos, chunk.is_thread_running()])
+
+	if not chunk.has_voxel(local_pos):
+		if log_debug:
+			print("[BLOCK] Already empty at %s" % local_pos)
+		return
+
+	chunk.erase_voxel(local_pos)
+	var t1 := Time.get_ticks_usec()
+	
+	if log_debug:
+		print("[BLOCK] Refreshing chunk %s, local: %s" % [chunk_pos, local_pos])
+	
+	_refresh_chunk_and_neighbors(chunk_pos, local_pos)
+	var t2 := Time.get_ticks_usec()  # 추가
+	
+	# 추가: 타이밍 로그
+	print("[BREAK] setup: %d µs, refresh: %d µs, total: %d µs" % [t1 - t0, t2 - t1, t2 - t0])
+
+func _global_to_local(global_pos: Vector3i, chunk_pos: Vector2i) -> Vector3i:
+	return Vector3i(
+		global_pos.x - chunk_pos.x * VoxelChunk.CHUNK_SIZE,
+		global_pos.y,
+		global_pos.z - chunk_pos.y * VoxelChunk.CHUNK_SIZE
+	)
+
+
+func _refresh_chunk_and_neighbors(chunk_pos: Vector2i, local_pos: Vector3i) -> void:
+	if log_debug:
+		print("[BLOCK] Refreshing chunk %s, local: %s" % [chunk_pos, local_pos])
+	
+	var chunk: VoxelChunk = active_chunks[chunk_pos]
+	chunk.start_threaded_mesh_update(chunk.has_physics_body(), true)  # ★ priority=true
+	
+	# 경계 블록이면 인접 청크도 갱신 (이웃은 일반 우선순위)
+	if local_pos.x == 0:
+		_refresh_neighbor(chunk_pos + Vector2i(-1, 0))
+	if local_pos.x == VoxelChunk.CHUNK_SIZE - 1:
+		_refresh_neighbor(chunk_pos + Vector2i(1, 0))
+	if local_pos.z == 0:
+		_refresh_neighbor(chunk_pos + Vector2i(0, -1))
+	if local_pos.z == VoxelChunk.CHUNK_SIZE - 1:
+		_refresh_neighbor(chunk_pos + Vector2i(0, 1))
+
+
+func _refresh_neighbor(neighbor_pos: Vector2i) -> void:
+	if active_chunks.has(neighbor_pos):
+		var neighbor: VoxelChunk = active_chunks[neighbor_pos]
+		neighbor.start_threaded_mesh_update(neighbor.has_physics_body())
+
+## Thread-safe 글로벌 좌표 블록 확인
+func is_block_solid_threadsafe(global_pos: Vector3i) -> bool:
+	var chunk_pos := Vector2i(
+		floori(float(global_pos.x) / VoxelChunk.CHUNK_SIZE),
+		floori(float(global_pos.z) / VoxelChunk.CHUNK_SIZE)
+	)
+	
+	if not active_chunks.has(chunk_pos):
+		return false
+	
+	var local_x: int = global_pos.x - (chunk_pos.x * VoxelChunk.CHUNK_SIZE)
+	var local_z: int = global_pos.z - (chunk_pos.y * VoxelChunk.CHUNK_SIZE)
+	var local_pos := Vector3i(local_x, global_pos.y, local_z)
+	
+	var chunk: VoxelChunk = active_chunks[chunk_pos]
+	return chunk.has_voxel_threadsafe(local_pos)
+
+func request_priority_chunk_apply(chunk: VoxelChunk) -> void:
+	if chunk not in _priority_apply_queue:
+		_priority_apply_queue.append(chunk)
